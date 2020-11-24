@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/amacneil/dbmate/pkg/dbmate"
-	"github.com/amacneil/dbmate/pkg/dbutil"
-	_ "github.com/amacneil/dbmate/pkg/driver/mysql"
-	_ "github.com/amacneil/dbmate/pkg/driver/postgres"
-	_ "github.com/amacneil/dbmate/pkg/driver/sqlite"
+	"github.com/assetnote/dbmate/pkg/dbmate"
+	"github.com/assetnote/dbmate/pkg/dbutil"
+	_ "github.com/assetnote/dbmate/pkg/driver/mysql"
+	_ "github.com/assetnote/dbmate/pkg/driver/postgres"
+	_ "github.com/assetnote/dbmate/pkg/driver/sqlite"
 
 	"github.com/kami-zh/go-capturer"
 	"github.com/stretchr/testify/require"

@@ -12,7 +12,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/amacneil/dbmate/pkg/dbutil"
+	"github.com/assetnote/dbmate/pkg/dbutil"
 )
 
 // DefaultMigrationsDir specifies default directory to find migration files
