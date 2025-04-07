@@ -3,7 +3,6 @@ package dbutil_test
 import (
 	"database/sql"
 	"testing"
-
 	"github.com/assetnote/dbmate/pkg/dbtest"
 	"github.com/assetnote/dbmate/pkg/dbutil"
 
