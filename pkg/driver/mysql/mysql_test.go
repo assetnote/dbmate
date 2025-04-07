@@ -3,18 +3,18 @@ package mysql
 import (
 	"database/sql"
 	"net/url"
-	"os"
 	"testing"
 
 	"github.com/assetnote/dbmate/pkg/dbmate"
+	"github.com/assetnote/dbmate/pkg/dbtest"
 	"github.com/assetnote/dbmate/pkg/dbutil"
 
 	"github.com/stretchr/testify/require"
 )
 
 func testMySQLDriver(t *testing.T) *Driver {
-	u := dbutil.MustParseURL(os.Getenv("MYSQL_TEST_URL"))
-	drv, err := dbmate.New(u).GetDriver()
+	u := dbtest.GetenvURLOrSkip(t, "MYSQL_TEST_URL")
+	drv, err := dbmate.New(u).Driver()
 	require.NoError(t, err)
 
 	return drv.(*Driver)
@@ -39,8 +39,8 @@ func prepTestMySQLDB(t *testing.T) *sql.DB {
 }
 
 func TestGetDriver(t *testing.T) {
-	db := dbmate.New(dbutil.MustParseURL("mysql://"))
-	drvInterface, err := db.GetDriver()
+	db := dbmate.New(dbtest.MustParseURL(t, "mysql://"))
+	drvInterface, err := db.Driver()
 	require.NoError(t, err)
 
 	// driver should have URL and default migrations table set
@@ -76,6 +76,18 @@ func TestConnectionString(t *testing.T) {
 
 		s := connectionString(u)
 		require.Equal(t, "duhfsd7s:123!@123!@@tcp(host:123)/foo?flag=on&multiStatements=true", s)
+	})
+
+	t.Run("url encoding", func(t *testing.T) {
+		u, err := url.Parse("mysql://bob%2Balice:secret%5E%5B%2A%28%29@host:123/foo")
+		require.NoError(t, err)
+		require.Equal(t, "bob+alice:secret%5E%5B%2A%28%29", u.User.String())
+		require.Equal(t, "123", u.Port())
+
+		s := connectionString(u)
+		// ensure that '+' is correctly encoded by url.PathUnescape as '+'
+		// (not whitespace as url.QueryUnescape generates)
+		require.Equal(t, "bob+alice:secret^[*()@tcp(host:123)/foo?multiStatements=true", s)
 	})
 
 	t.Run("socket", func(t *testing.T) {
@@ -133,6 +145,42 @@ func TestMySQLCreateDropDatabase(t *testing.T) {
 	}()
 }
 
+func TestMySQLDumpArgs(t *testing.T) {
+	drv := testMySQLDriver(t)
+	drv.databaseURL = dbtest.MustParseURL(t, "mysql://bob/mydb")
+
+	require.Equal(t, []string{"--opt",
+		"--routines",
+		"--no-data",
+		"--skip-dump-date",
+		"--skip-add-drop-table",
+		"--host=bob",
+		"mydb"}, drv.mysqldumpArgs())
+
+	drv.databaseURL = dbtest.MustParseURL(t, "mysql://alice:pw@bob:5678/mydb")
+	require.Equal(t, []string{"--opt",
+		"--routines",
+		"--no-data",
+		"--skip-dump-date",
+		"--skip-add-drop-table",
+		"--host=bob",
+		"--port=5678",
+		"--user=alice",
+		"--password=pw",
+		"mydb"}, drv.mysqldumpArgs())
+
+	drv.databaseURL = dbtest.MustParseURL(t, "mysql://alice:pw@bob:5678/mydb?socket=/var/run/mysqld/mysqld.sock")
+	require.Equal(t, []string{"--opt",
+		"--routines",
+		"--no-data",
+		"--skip-dump-date",
+		"--skip-add-drop-table",
+		"--socket=/var/run/mysqld/mysqld.sock",
+		"--user=alice",
+		"--password=pw",
+		"mydb"}, drv.mysqldumpArgs())
+}
+
 func TestMySQLDumpSchema(t *testing.T) {
 	drv := testMySQLDriver(t)
 	drv.migrationsTableName = "test_migrations"
@@ -167,10 +215,36 @@ func TestMySQLDumpSchema(t *testing.T) {
 	drv.databaseURL.Path = "/fakedb"
 	schema, err = drv.DumpSchema(db)
 	require.Nil(t, schema)
-	require.EqualError(t, err, "mysqldump: [Warning] Using a password "+
-		"on the command line interface can be insecure.\n"+
-		"mysqldump: Got error: 1049: "+
-		"Unknown database 'fakedb' when selecting the database")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Unknown database 'fakedb'")
+}
+
+func TestMySQLDumpSchemaContainsNoAutoIncrement(t *testing.T) {
+	drv := testMySQLDriver(t)
+
+	db := prepTestMySQLDB(t)
+	defer dbutil.MustClose(db)
+	err := drv.CreateMigrationsTable(db)
+	require.NoError(t, err)
+
+	// create table with AUTO_INCREMENT column
+	_, err = db.Exec(`create table foo_table (id int not null primary key auto_increment)`)
+	require.NoError(t, err)
+
+	// create a record
+	_, err = db.Exec(`insert into foo_table values ()`)
+	require.NoError(t, err)
+
+	// AUTO_INCREMENT should appear on the table definition
+	var tblName, tblCreate string
+	err = db.QueryRow(`show create table foo_table`).Scan(&tblName, &tblCreate)
+	require.NoError(t, err)
+	require.Contains(t, tblCreate, "AUTO_INCREMENT=")
+
+	// AUTO_INCREMENT should not appear in the dump
+	schema, err := drv.DumpSchema(db)
+	require.NoError(t, err)
+	require.NotContains(t, string(schema), "AUTO_INCREMENT=")
 }
 
 func TestMySQLDatabaseExists(t *testing.T) {

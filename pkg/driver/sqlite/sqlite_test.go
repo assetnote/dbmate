@@ -1,3 +1,4 @@
+//go:build cgo
 // +build cgo
 
 package sqlite
@@ -8,14 +9,15 @@ import (
 	"testing"
 
 	"github.com/assetnote/dbmate/pkg/dbmate"
+	"github.com/assetnote/dbmate/pkg/dbtest"
 	"github.com/assetnote/dbmate/pkg/dbutil"
 
 	"github.com/stretchr/testify/require"
 )
 
 func testSQLiteDriver(t *testing.T) *Driver {
-	u := dbutil.MustParseURL(os.Getenv("SQLITE_TEST_URL"))
-	drv, err := dbmate.New(u).GetDriver()
+	u := dbtest.MustParseURL(t, "sqlite:dbmate_test.sqlite3")
+	drv, err := dbmate.New(u).Driver()
 	require.NoError(t, err)
 
 	return drv.(*Driver)
@@ -40,8 +42,8 @@ func prepTestSQLiteDB(t *testing.T) *sql.DB {
 }
 
 func TestGetDriver(t *testing.T) {
-	db := dbmate.New(dbutil.MustParseURL("sqlite://"))
-	drvInterface, err := db.GetDriver()
+	db := dbmate.New(dbtest.MustParseURL(t, "sqlite://"))
+	drvInterface, err := db.Driver()
 	require.NoError(t, err)
 
 	// driver should have URL and default migrations table set
@@ -53,26 +55,87 @@ func TestGetDriver(t *testing.T) {
 
 func TestConnectionString(t *testing.T) {
 	t.Run("relative", func(t *testing.T) {
-		u := dbutil.MustParseURL("sqlite:foo/bar.sqlite3?mode=ro")
+		u := dbtest.MustParseURL(t, "sqlite:foo/bar.sqlite3?mode=ro")
 		require.Equal(t, "foo/bar.sqlite3?mode=ro", ConnectionString(u))
 	})
 
+	t.Run("relative with dot", func(t *testing.T) {
+		u := dbtest.MustParseURL(t, "sqlite:./foo/bar.sqlite3?mode=ro")
+		require.Equal(t, "./foo/bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("relative with double dot", func(t *testing.T) {
+		u := dbtest.MustParseURL(t, "sqlite:../foo/bar.sqlite3?mode=ro")
+		require.Equal(t, "../foo/bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
 	t.Run("absolute", func(t *testing.T) {
-		u := dbutil.MustParseURL("sqlite:/tmp/foo.sqlite3?mode=ro")
+		u := dbtest.MustParseURL(t, "sqlite:/tmp/foo.sqlite3?mode=ro")
+		require.Equal(t, "/tmp/foo.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("two slashes", func(t *testing.T) {
+		// interpreted as absolute path
+		u := dbtest.MustParseURL(t, "sqlite://tmp/foo.sqlite3?mode=ro")
 		require.Equal(t, "/tmp/foo.sqlite3?mode=ro", ConnectionString(u))
 	})
 
 	t.Run("three slashes", func(t *testing.T) {
 		// interpreted as absolute path
-		u := dbutil.MustParseURL("sqlite:///tmp/foo.sqlite3?mode=ro")
+		u := dbtest.MustParseURL(t, "sqlite:///tmp/foo.sqlite3?mode=ro")
 		require.Equal(t, "/tmp/foo.sqlite3?mode=ro", ConnectionString(u))
 	})
 
 	t.Run("four slashes", func(t *testing.T) {
 		// interpreted as absolute path
 		// supported for backwards compatibility
-		u := dbutil.MustParseURL("sqlite:////tmp/foo.sqlite3?mode=ro")
+		u := dbtest.MustParseURL(t, "sqlite:////tmp/foo.sqlite3?mode=ro")
 		require.Equal(t, "/tmp/foo.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("relative with space", func(t *testing.T) {
+		u := dbtest.MustParseURL(t, "sqlite:foo bar.sqlite3?mode=ro")
+		require.Equal(t, "foo bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("relative with space and dot", func(t *testing.T) {
+		u := dbtest.MustParseURL(t, "sqlite:./foo bar.sqlite3?mode=ro")
+		require.Equal(t, "./foo bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("relative with space and double dot", func(t *testing.T) {
+		u := dbtest.MustParseURL(t, "sqlite:../foo bar.sqlite3?mode=ro")
+		require.Equal(t, "../foo bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("absolute with space", func(t *testing.T) {
+		u := dbtest.MustParseURL(t, "sqlite:/foo bar.sqlite3?mode=ro")
+		require.Equal(t, "/foo bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("two slashes with space in path", func(t *testing.T) {
+		// interpreted as absolute path
+		u := dbtest.MustParseURL(t, "sqlite://tmp/foo bar.sqlite3?mode=ro")
+		require.Equal(t, "/tmp/foo bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("three slashes with space in path", func(t *testing.T) {
+		// interpreted as absolute path
+		u := dbtest.MustParseURL(t, "sqlite:///tmp/foo bar.sqlite3?mode=ro")
+		require.Equal(t, "/tmp/foo bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("three slashes with space in path (1st dir)", func(t *testing.T) {
+		// interpreted as absolute path
+		u := dbtest.MustParseURL(t, "sqlite:///tm p/foo bar.sqlite3?mode=ro")
+		require.Equal(t, "/tm p/foo bar.sqlite3?mode=ro", ConnectionString(u))
+	})
+
+	t.Run("four slashes with space", func(t *testing.T) {
+		// interpreted as absolute path
+		// supported for backwards compatibility
+		u := dbtest.MustParseURL(t, "sqlite:////tmp/foo bar.sqlite3?mode=ro")
+		require.Equal(t, "/tmp/foo bar.sqlite3?mode=ro", ConnectionString(u))
 	})
 }
 
@@ -118,22 +181,29 @@ func TestSQLiteDumpSchema(t *testing.T) {
 	err = drv.InsertMigration(db, "abc2")
 	require.NoError(t, err)
 
+	// create a table that will trigger `sqlite_sequence` system table
+	_, err = db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+	require.NoError(t, err)
+
 	// DumpSchema should return schema
 	schema, err := drv.DumpSchema(db)
 	require.NoError(t, err)
+	require.Contains(t, string(schema), "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)")
 	require.Contains(t, string(schema), "CREATE TABLE IF NOT EXISTS \"test_migrations\"")
 	require.Contains(t, string(schema), ");\n-- Dbmate schema migrations\n"+
 		"INSERT INTO \"test_migrations\" (version) VALUES\n"+
 		"  ('abc1'),\n"+
 		"  ('abc2');\n")
 
+	// sqlite_* tables should not be present in the dump (.schema --nosys)
+	require.NotContains(t, string(schema), "sqlite_")
+
 	// DumpSchema should return error if command fails
-	drv.databaseURL = dbutil.MustParseURL(".")
+	drv.databaseURL = dbtest.MustParseURL(t, ".")
 	schema, err = drv.DumpSchema(db)
 	require.Nil(t, schema)
 	require.Error(t, err)
-	require.EqualError(t, err, "Error: unable to open database \".\": "+
-		"unable to open database file")
+	require.EqualError(t, err, "Error: unable to open database \"/.\": unable to open database file")
 }
 
 func TestSQLiteDatabaseExists(t *testing.T) {
@@ -316,7 +386,8 @@ func TestSQLitePing(t *testing.T) {
 
 	// ping database should fail
 	err = drv.Ping()
-	require.EqualError(t, err, "unable to open database file: is a directory")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unable to open database file")
 }
 
 func TestSQLiteQuotedMigrationsTableName(t *testing.T) {
@@ -333,4 +404,13 @@ func TestSQLiteQuotedMigrationsTableName(t *testing.T) {
 		name := drv.quotedMigrationsTableName()
 		require.Equal(t, `"fooMigrations"`, name)
 	})
+}
+
+func TestSQLiteFTS5Available(t *testing.T) {
+	db := prepTestSQLiteDB(t)
+	defer dbutil.MustClose(db)
+
+	// this only passes if the FTS5 module is statically compiled in to the SQLite driver
+	_, err := db.Exec("CREATE VIRTUAL TABLE a USING fts5(b, c)")
+	require.NoError(t, err)
 }

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"testing"
 
+	"github.com/assetnote/dbmate/pkg/dbtest"
 	"github.com/assetnote/dbmate/pkg/dbutil"
 
 	_ "github.com/mattn/go-sqlite3" // database/sql driver
@@ -12,13 +13,13 @@ import (
 
 func TestDatabaseName(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
-		u := dbutil.MustParseURL("foo://host/dbname?query")
+		u := dbtest.MustParseURL(t, "foo://host/dbname?query")
 		name := dbutil.DatabaseName(u)
 		require.Equal(t, "dbname", name)
 	})
 
 	t.Run("empty", func(t *testing.T) {
-		u := dbutil.MustParseURL("foo://host")
+		u := dbtest.MustParseURL(t, "foo://host")
 		name := dbutil.DatabaseName(u)
 		require.Equal(t, "", name)
 	})

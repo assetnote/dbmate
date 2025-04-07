@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/url"
+	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/assetnote/dbmate/pkg/dbmate"
@@ -16,12 +19,15 @@ import (
 func init() {
 	dbmate.RegisterDriver(NewDriver, "postgres")
 	dbmate.RegisterDriver(NewDriver, "postgresql")
+	dbmate.RegisterDriver(NewDriver, "redshift")
+	dbmate.RegisterDriver(NewDriver, "spanner-postgres")
 }
 
 // Driver provides top level database functions
 type Driver struct {
 	migrationsTableName string
 	databaseURL         *url.URL
+	log                 io.Writer
 }
 
 // NewDriver initializes the driver
@@ -29,6 +35,7 @@ func NewDriver(config dbmate.DriverConfig) dbmate.Driver {
 	return &Driver{
 		migrationsTableName: config.MigrationsTableName,
 		databaseURL:         config.DatabaseURL,
+		log:                 config.Log,
 	}
 }
 
@@ -44,8 +51,15 @@ func connectionString(u *url.URL) string {
 	}
 
 	// default hostname
-	if hostname == "" {
-		hostname = "localhost"
+	if hostname == "" && query.Get("host") == "" {
+		switch runtime.GOOS {
+		case "linux":
+			query.Set("host", "/var/run/postgresql")
+		case "darwin", "freebsd", "dragonfly", "openbsd", "netbsd":
+			query.Set("host", "/tmp")
+		default:
+			hostname = "localhost"
+		}
 	}
 
 	// host param overrides url hostname
@@ -59,24 +73,35 @@ func connectionString(u *url.URL) string {
 		query.Del("port")
 	}
 	if port == "" {
-		port = "5432"
+		switch u.Scheme {
+		case "redshift":
+			port = "5439"
+		default:
+			port = "5432"
+		}
 	}
 
 	// generate output URL
 	out, _ := url.Parse(u.String())
+	// force scheme back to postgres if there was another postgres-compatible scheme
+	out.Scheme = "postgres"
 	out.Host = fmt.Sprintf("%s:%s", hostname, port)
 	out.RawQuery = query.Encode()
 
 	return out.String()
 }
 
-func connectionArgsForDump(u *url.URL) []string {
-	u = dbutil.MustParseURL(connectionString(u))
+func connectionArgsForDump(conn *url.URL) []string {
+	u, err := url.Parse(connectionString(conn))
+	if err != nil {
+		panic(err)
+	}
 
 	// find schemas from search_path
 	query := u.Query()
 	schemas := strings.Split(query.Get("search_path"), ",")
 	query.Del("search_path")
+	query.Del("binary_parameters")
 	u.RawQuery = query.Encode()
 
 	out := []string{}
@@ -103,8 +128,10 @@ func (drv *Driver) openPostgresDB() (*sql.DB, error) {
 		return nil, err
 	}
 
-	// connect to postgres database
-	postgresURL.Path = "postgres"
+	// connect to postgres database, unless this is a Redshift connection
+	if drv.databaseURL.Scheme != "redshift" {
+		postgresURL.Path = "postgres"
+	}
 
 	return sql.Open("postgres", postgresURL.String())
 }
@@ -112,7 +139,7 @@ func (drv *Driver) openPostgresDB() (*sql.DB, error) {
 // CreateDatabase creates the specified database
 func (drv *Driver) CreateDatabase() error {
 	name := dbutil.DatabaseName(drv.databaseURL)
-	fmt.Printf("Creating: %s\n", name)
+	fmt.Fprintf(drv.log, "Creating: %s\n", name)
 
 	db, err := drv.openPostgresDB()
 	if err != nil {
@@ -129,7 +156,7 @@ func (drv *Driver) CreateDatabase() error {
 // DropDatabase drops the specified database (if it exists)
 func (drv *Driver) DropDatabase() error {
 	name := dbutil.DatabaseName(drv.databaseURL)
-	fmt.Printf("Dropping: %s\n", name)
+	fmt.Fprintf(drv.log, "Dropping: %s\n", name)
 
 	db, err := drv.openPostgresDB()
 	if err != nil {
@@ -208,6 +235,27 @@ func (drv *Driver) DatabaseExists() (bool, error) {
 	return exists, err
 }
 
+// MigrationsTableExists checks if the schema_migrations table exists
+func (drv *Driver) MigrationsTableExists(db *sql.DB) (bool, error) {
+	schema, migrationsTableNameParts, err := drv.migrationsTableNameParts(db)
+	if err != nil {
+		return false, err
+	}
+
+	migrationsTable := strings.Join(migrationsTableNameParts, ".")
+	exists := false
+	err = db.QueryRow("SELECT 1 FROM information_schema.tables "+
+		"WHERE  table_schema = $1 "+
+		"AND    table_name   = $2",
+		schema, migrationsTable).
+		Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+
+	return exists, err
+}
+
 // CreateMigrationsTable creates the schema_migrations table
 func (drv *Driver) CreateMigrationsTable(db *sql.DB) error {
 	schema, migrationsTable, err := drv.quotedMigrationsTableNameParts(db)
@@ -216,8 +264,9 @@ func (drv *Driver) CreateMigrationsTable(db *sql.DB) error {
 	}
 
 	// first attempt at creating migrations table
-	createTableStmt := fmt.Sprintf("create table if not exists %s.%s", schema, migrationsTable) +
-		" (version varchar(255) primary key)"
+	createTableStmt := fmt.Sprintf(
+		"create table if not exists %s.%s (version varchar(128) primary key)",
+		schema, migrationsTable)
 	_, err = db.Exec(createTableStmt)
 	if err == nil {
 		// table exists or created successfully
@@ -233,7 +282,7 @@ func (drv *Driver) CreateMigrationsTable(db *sql.DB) error {
 
 	// in theory we could attempt to create the schema every time, but we avoid that
 	// in case the user doesn't have permissions to create schemas
-	fmt.Printf("Creating schema: %s\n", schema)
+	fmt.Fprintf(drv.log, "Creating schema: %s\n", schema)
 	_, err = db.Exec(fmt.Sprintf("create schema if not exists %s", schema))
 	if err != nil {
 		return err
@@ -330,6 +379,19 @@ func (drv *Driver) Ping() error {
 	return err
 }
 
+// Return a normalized version of the driver-specific error type.
+func (drv *Driver) QueryError(query string, err error) error {
+	position := 0
+
+	if pqErr, ok := err.(*pq.Error); ok {
+		if pos, err := strconv.Atoi(pqErr.Position); err == nil {
+			position = pos
+		}
+	}
+
+	return &dbmate.QueryError{Err: err, Query: query, Position: position}
+}
+
 func (drv *Driver) quotedMigrationsTableName(db dbutil.Transaction) (string, error) {
 	schema, name, err := drv.quotedMigrationsTableNameParts(db)
 	if err != nil {
@@ -339,7 +401,7 @@ func (drv *Driver) quotedMigrationsTableName(db dbutil.Transaction) (string, err
 	return schema + "." + name, nil
 }
 
-func (drv *Driver) quotedMigrationsTableNameParts(db dbutil.Transaction) (string, string, error) {
+func (drv *Driver) migrationsTableNameParts(db dbutil.Transaction) (string, []string, error) {
 	schema := ""
 	tableNameParts := strings.Split(drv.migrationsTableName, ".")
 	if len(tableNameParts) > 1 {
@@ -359,13 +421,28 @@ func (drv *Driver) quotedMigrationsTableNameParts(db dbutil.Transaction) (string
 		// this is a hack because we don't always have the URL context available
 		schema, err = dbutil.QueryValue(db, "select current_schema()")
 		if err != nil {
-			return "", "", err
+			return "", nil, err
 		}
 	}
 
 	// fall back to public schema as last resort
 	if schema == "" {
 		schema = "public"
+	}
+
+	return schema, tableNameParts, nil
+}
+
+func (drv *Driver) quotedMigrationsTableNameParts(db dbutil.Transaction) (string, string, error) {
+	schema, tableNameParts, err := drv.migrationsTableNameParts(db)
+
+	if err != nil {
+		return "", "", err
+	}
+
+	// Quote identifiers for Redshift and Spanner
+	if drv.databaseURL.Scheme == "redshift" || drv.databaseURL.Scheme == "spanner-postgres" {
+		return pq.QuoteIdentifier(schema), pq.QuoteIdentifier(strings.Join(tableNameParts, ".")), nil
 	}
 
 	// quote all parts

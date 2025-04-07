@@ -2,19 +2,38 @@ package postgres
 
 import (
 	"database/sql"
+	"fmt"
 	"net/url"
-	"os"
+	"runtime"
 	"testing"
 
 	"github.com/assetnote/dbmate/pkg/dbmate"
+	"github.com/assetnote/dbmate/pkg/dbtest"
 	"github.com/assetnote/dbmate/pkg/dbutil"
 
 	"github.com/stretchr/testify/require"
 )
 
 func testPostgresDriver(t *testing.T) *Driver {
-	u := dbutil.MustParseURL(os.Getenv("POSTGRES_TEST_URL"))
-	drv, err := dbmate.New(u).GetDriver()
+	u := dbtest.GetenvURLOrSkip(t, "POSTGRES_TEST_URL")
+	drv, err := dbmate.New(u).Driver()
+	require.NoError(t, err)
+
+	return drv.(*Driver)
+}
+
+func testRedshiftDriver(t *testing.T) *Driver {
+	u := dbtest.GetenvURLOrSkip(t, "REDSHIFT_TEST_URL")
+	drv, err := dbmate.New(u).Driver()
+	require.NoError(t, err)
+
+	return drv.(*Driver)
+}
+
+func testSpannerPostgresDriver(t *testing.T) *Driver {
+	// URL to the spanner pgadapter, or a locally-running spanner emulator with the pgadapter
+	u := dbtest.GetenvURLOrSkip(t, "SPANNER_POSTGRES_TEST_URL")
+	drv, err := dbmate.New(u).Driver()
 	require.NoError(t, err)
 
 	return drv.(*Driver)
@@ -32,15 +51,46 @@ func prepTestPostgresDB(t *testing.T) *sql.DB {
 	require.NoError(t, err)
 
 	// connect database
-	db, err := sql.Open("postgres", drv.databaseURL.String())
+	db, err := sql.Open("postgres", connectionString(drv.databaseURL))
+	require.NoError(t, err)
+
+	return db
+}
+
+func prepRedshiftTestDB(t *testing.T, drv *Driver) *sql.DB {
+	// connect database
+	db, err := sql.Open("postgres", connectionString(drv.databaseURL))
+	require.NoError(t, err)
+
+	_, migrationsTable, err := drv.quotedMigrationsTableNameParts(db)
+	if err != nil {
+		t.Error(err)
+	}
+
+	_, err = db.Exec(fmt.Sprintf("drop table if exists %s", migrationsTable))
+	require.NoError(t, err)
+
+	return db
+}
+
+func prepTestSpannerPostgresDB(t *testing.T, drv *Driver) *sql.DB {
+	// Spanner doesn't allow running `drop database`, so we just drop the migrations
+	// table instead
+	db, err := sql.Open("postgres", connectionString(drv.databaseURL))
+	require.NoError(t, err)
+
+	_, migrationsTable, err := drv.quotedMigrationsTableNameParts(db)
+	require.NoError(t, err)
+
+	_, err = db.Exec(fmt.Sprintf("drop table if exists %s", migrationsTable))
 	require.NoError(t, err)
 
 	return db
 }
 
 func TestGetDriver(t *testing.T) {
-	db := dbmate.New(dbutil.MustParseURL("postgres://"))
-	drvInterface, err := db.GetDriver()
+	db := dbmate.New(dbtest.MustParseURL(t, "postgres://"))
+	drvInterface, err := db.Driver()
 	require.NoError(t, err)
 
 	// driver should have URL and default migrations table set
@@ -50,13 +100,24 @@ func TestGetDriver(t *testing.T) {
 	require.Equal(t, "schema_migrations", drv.migrationsTableName)
 }
 
+func defaultConnString() string {
+	switch runtime.GOOS {
+	case "linux":
+		return "postgres://:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"
+	case "darwin", "freebsd", "dragonfly", "openbsd", "netbsd":
+		return "postgres://:5432/foo?host=%2Ftmp"
+	default:
+		return "postgres://localhost:5432/foo"
+	}
+}
+
 func TestConnectionString(t *testing.T) {
 	cases := []struct {
 		input    string
 		expected string
 	}{
 		// defaults
-		{"postgres:///foo", "postgres://localhost:5432/foo"},
+		{"postgres:///foo", defaultConnString()},
 		// support custom url params
 		{"postgres://bob:secret@myhost:1234/foo?bar=baz", "postgres://bob:secret@myhost:1234/foo?bar=baz"},
 		// support `host` and `port` via url params
@@ -66,6 +127,11 @@ func TestConnectionString(t *testing.T) {
 		{"postgres://bob:secret@myhost:1234/foo?host=/var/run/postgresql", "postgres://bob:secret@:1234/foo?host=%2Fvar%2Frun%2Fpostgresql"},
 		{"postgres://bob:secret@localhost/foo?socket=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
 		{"postgres:///foo?socket=/var/run/postgresql", "postgres://:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
+		{"postgres://bob:secret@/foo?socket=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
+		{"postgres://bob:secret@/foo?host=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
+		// redshift default port is 5439, not 5432
+		{"redshift://myhost/foo", "postgres://myhost:5439/foo"},
+		{"spanner-postgres://myhost/foo", "postgres://myhost:5432/foo"},
 	}
 
 	for _, c := range cases {
@@ -85,11 +151,11 @@ func TestConnectionArgsForDump(t *testing.T) {
 		expected []string
 	}{
 		// defaults
-		{"postgres:///foo", []string{"postgres://localhost:5432/foo"}},
+		{"postgres:///foo", []string{defaultConnString()}},
 		// support single schema
-		{"postgres:///foo?search_path=foo", []string{"--schema", "foo", "postgres://localhost:5432/foo"}},
+		{"postgres:///foo?search_path=foo", []string{"--schema", "foo", defaultConnString()}},
 		// support multiple schemas
-		{"postgres:///foo?search_path=foo,public", []string{"--schema", "foo", "--schema", "public", "postgres://localhost:5432/foo"}},
+		{"postgres:///foo?search_path=foo,public", []string{"--schema", "foo", "--schema", "public", defaultConnString()}},
 	}
 
 	for _, c := range cases {
@@ -174,8 +240,8 @@ func TestPostgresDumpSchema(t *testing.T) {
 		drv.databaseURL.Path = "/fakedb"
 		schema, err = drv.DumpSchema(db)
 		require.Nil(t, schema)
-		require.EqualError(t, err, "pg_dump: [archiver (db)] connection to database "+
-			"\"fakedb\" failed: FATAL:  database \"fakedb\" does not exist")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "database \"fakedb\" does not exist")
 	})
 
 	t.Run("custom migrations table with schema", func(t *testing.T) {
@@ -349,6 +415,54 @@ func TestPostgresCreateMigrationsTable(t *testing.T) {
 
 		// create table should be idempotent
 		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+	})
+}
+
+func TestRedshiftCreateMigrationsTable(t *testing.T) {
+	t.Run("default schema", func(t *testing.T) {
+		drv := testRedshiftDriver(t)
+		db := prepRedshiftTestDB(t, drv)
+		defer dbutil.MustClose(db)
+
+		// migrations table should not exist
+		count := 0
+		err := db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
+		require.Error(t, err, "migrations table exists when it shouldn't")
+		require.Equal(t, "pq: relation \"public.schema_migrations\" does not exist", err.Error())
+
+		// create table
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		// migrations table should exist
+		err = db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
+		require.NoError(t, err)
+
+		// create table should be idempotent
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+	})
+}
+
+func TestSpannerPostgresCreateMigrationsTable(t *testing.T) {
+	t.Run("default schema", func(t *testing.T) {
+		drv := testSpannerPostgresDriver(t)
+		db := prepTestSpannerPostgresDB(t, drv)
+		defer dbutil.MustClose(db)
+
+		// migrations table should not exist
+		count := 0
+		err := db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
+		require.Error(t, err, "migrations table exists when it shouldn't")
+		require.Contains(t, err.Error(), "pq: relation \"public.schema_migrations\" does not exist")
+
+		// create table
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		// migrations table should exist
+		err = db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
 		require.NoError(t, err)
 	})
 }
@@ -565,5 +679,114 @@ func TestPostgresQuotedMigrationsTableName(t *testing.T) {
 		name, err = drv.quotedMigrationsTableName(db)
 		require.NoError(t, err)
 		require.Equal(t, "\"whyWould\".i.\"doThis\"", name)
+	})
+}
+
+func TestPostgresMigrationsTableExists(t *testing.T) {
+	t.Run("default schema", func(t *testing.T) {
+		drv := testPostgresDriver(t)
+		drv.migrationsTableName = "test_migrations"
+
+		db := prepTestPostgresDB(t)
+		defer dbutil.MustClose(db)
+
+		exists, err := drv.MigrationsTableExists(db)
+		require.NoError(t, err)
+		require.Equal(t, false, exists)
+
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		exists, err = drv.MigrationsTableExists(db)
+		require.NoError(t, err)
+		require.Equal(t, true, exists)
+	})
+
+	t.Run("custom schema", func(t *testing.T) {
+		drv := testPostgresDriver(t)
+		u, err := url.Parse(drv.databaseURL.String() + "&search_path=foo")
+		require.NoError(t, err)
+		drv.databaseURL = u
+
+		db := prepTestPostgresDB(t)
+		defer dbutil.MustClose(db)
+
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		exists, err := drv.MigrationsTableExists(db)
+		require.NoError(t, err)
+		require.Equal(t, true, exists)
+	})
+
+	t.Run("custom schema with special chars", func(t *testing.T) {
+		drv := testPostgresDriver(t)
+		u, err := url.Parse(drv.databaseURL.String() + "&search_path=custom-schema")
+		require.NoError(t, err)
+		drv.databaseURL = u
+
+		db := prepTestPostgresDB(t)
+		defer dbutil.MustClose(db)
+
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		exists, err := drv.MigrationsTableExists(db)
+		require.NoError(t, err)
+		require.Equal(t, true, exists)
+	})
+
+	t.Run("custom migrations table name containing schema with special chars", func(t *testing.T) {
+		drv := testPostgresDriver(t)
+		drv.migrationsTableName = "custom$schema.schema_migrations"
+		u, err := url.Parse(drv.databaseURL.String())
+		require.NoError(t, err)
+		drv.databaseURL = u
+
+		db := prepTestPostgresDB(t)
+		defer dbutil.MustClose(db)
+
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		exists, err := drv.MigrationsTableExists(db)
+		require.NoError(t, err)
+		require.Equal(t, true, exists)
+	})
+
+	t.Run("custom migrations table name containing table name with special chars", func(t *testing.T) {
+		drv := testPostgresDriver(t)
+		drv.migrationsTableName = "schema.custom#table#name"
+		u, err := url.Parse(drv.databaseURL.String())
+		require.NoError(t, err)
+		drv.databaseURL = u
+
+		db := prepTestPostgresDB(t)
+		defer dbutil.MustClose(db)
+
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		exists, err := drv.MigrationsTableExists(db)
+		require.NoError(t, err)
+		require.Equal(t, true, exists)
+	})
+
+	t.Run("custom migrations table name containing schema and table name with special chars", func(t *testing.T) {
+		drv := testPostgresDriver(t)
+		drv.migrationsTableName = "custom-schema.custom@table@name"
+		u, err := url.Parse(drv.databaseURL.String())
+		require.NoError(t, err)
+		drv.databaseURL = u
+
+		db := prepTestPostgresDB(t)
+		defer dbutil.MustClose(db)
+
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		exists, err := drv.MigrationsTableExists(db)
+		require.NoError(t, err)
+		require.Equal(t, true, exists)
 	})
 }

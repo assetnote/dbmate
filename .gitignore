@@ -1,8 +1,14 @@
 .DS_Store
 .env
+.idea
+*.log
+*.sqlite3
+*.tsbuildinfo
 /.cache
 /db
 /dbmate
-/dist
 /testdata/db/schema.sql
 /vendor
+dist
+docker-compose.override.yml
+node_modules

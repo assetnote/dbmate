@@ -1,59 +1,81 @@
-# no static linking for macos
-LDFLAGS := -ldflags '-s'
-# statically link binaries (to support alpine + scratch containers)
-STATICLDFLAGS := -ldflags '-s -extldflags "-static"'
-# avoid building code that is incompatible with static linking
-TAGS := -tags netgo,osusergo,sqlite_omit_load_extension,sqlite_json
+# enable cgo to build sqlite
+export CGO_ENABLED = 1
+
+# default output file
+OUTPUT ?= dbmate
+
+# platform-specific settings
+GOOS := $(shell go env GOOS)
+ifeq ($(GOOS),linux)
+	# statically link binaries to support alpine linux
+	override FLAGS := -tags netgo,osusergo,sqlite_omit_load_extension,sqlite_fts5,sqlite_json -ldflags '-s -extldflags "-static"' $(FLAGS)
+else
+	# strip binaries
+	override FLAGS := -tags sqlite_omit_load_extension,sqlite_fts5,sqlite_json -ldflags '-s' $(FLAGS)
+endif
+ifeq ($(GOOS),darwin)
+	export SDKROOT ?= $(shell xcrun --sdk macosx --show-sdk-path)
+endif
+ifeq ($(GOOS),windows)
+	ifneq ($(suffix $(OUTPUT)),.exe)
+		OUTPUT := $(addsuffix .exe,$(OUTPUT))
+	endif
+endif
 
 .PHONY: all
-all: build test lint
-
-.PHONY: test
-test:
-	go test -p 1 $(TAGS) $(STATICLDFLAGS) ./...
-
-.PHONY: fix
-fix:
-	golangci-lint run --fix
-
-.PHONY: lint
-lint:
-	golangci-lint run
-
-.PHONY: wait
-wait:
-	dist/dbmate-linux-amd64 -e CLICKHOUSE_TEST_URL wait
-	dist/dbmate-linux-amd64 -e MYSQL_TEST_URL wait
-	dist/dbmate-linux-amd64 -e POSTGRES_TEST_URL wait
+all: fix build wait test
 
 .PHONY: clean
 clean:
-	rm -rf dist/*
+	rm -rf dist
 
 .PHONY: build
-build: clean build-linux-amd64
-	ls -lh dist
+build: clean
+	go build -o dist/$(OUTPUT) $(FLAGS) .
 
-.PHONY: build-linux-amd64
-build-linux-amd64:
-	GOOS=linux GOARCH=amd64 \
-	     go build $(TAGS) $(STATICLDFLAGS) -o dist/dbmate-linux-amd64 .
+.PHONY: ls
+ls:
+	ls -lh dist/$(OUTPUT)
+	file dist/$(OUTPUT)
 
-.PHONY: build-all
-build-all: clean build-linux-amd64
-	GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc-5 CXX=aarch64-linux-gnu-g++-5 \
-	     go build $(TAGS) $(STATICLDFLAGS) -o dist/dbmate-linux-arm64 .
-	GOOS=darwin GOARCH=amd64 CC=o64-clang CXX=o64-clang++ \
-	     go build $(TAGS) $(LDFLAGS) -o dist/dbmate-macos-amd64 .
-	GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc-posix CXX=x86_64-w64-mingw32-g++-posix \
-	     go build $(TAGS) $(STATICLDFLAGS) -o dist/dbmate-windows-amd64.exe .
-	ls -lh dist
+.PHONY: test
+test:
+	go test -v -p 1 $(FLAGS) ./...
 
-.PHONY: docker-make
-docker-make:
-	docker-compose build
-	docker-compose run --rm dev make
+.PHONY: lint
+lint:
+	golangci-lint run --timeout 5m
+
+.PHONY: fix
+fix:
+	golangci-lint run --fix --timeout 5m
+
+.PHONY: wait
+wait:
+	dist/dbmate -e CLICKHOUSE_TEST_URL wait
+	dist/dbmate -e MYSQL_TEST_URL wait
+	dist/dbmate -e POSTGRES_TEST_URL wait
+
+.PHONY: update-deps
+update-deps:
+	go get -u ./...
+	go mod tidy
+	go mod verify
+	cd typescript && \
+		rm -f package-lock.json && \
+		./node_modules/.bin/npm-check-updates --upgrade && \
+		npm install && \
+		npm dedupe
+
+.PHONY: docker-build
+docker-build:
+	docker compose pull --ignore-buildable
+	docker compose build dev
+
+.PHONY: docker-all
+docker-all: docker-build
+	docker compose run --rm dev make all
 
 .PHONY: docker-sh
 docker-sh:
-	-docker-compose run --rm dev
+	-docker compose run --rm dev

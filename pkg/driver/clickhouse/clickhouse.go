@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"sort"
@@ -12,7 +13,7 @@ import (
 	"github.com/assetnote/dbmate/pkg/dbmate"
 	"github.com/assetnote/dbmate/pkg/dbutil"
 
-	"github.com/ClickHouse/clickhouse-go"
+	"github.com/ClickHouse/clickhouse-go/v2"
 )
 
 func init() {
@@ -23,6 +24,8 @@ func init() {
 type Driver struct {
 	migrationsTableName string
 	databaseURL         *url.URL
+	log                 io.Writer
+	clusterParameters   *ClusterParameters
 }
 
 // NewDriver initializes the driver
@@ -30,13 +33,15 @@ func NewDriver(config dbmate.DriverConfig) dbmate.Driver {
 	return &Driver{
 		migrationsTableName: config.MigrationsTableName,
 		databaseURL:         config.DatabaseURL,
+		log:                 config.Log,
+		clusterParameters:   ExtractClusterParametersFromURL(config.DatabaseURL),
 	}
 }
 
 func connectionString(initialURL *url.URL) string {
-	u := *initialURL
+	// clone url
+	u, _ := url.Parse(initialURL.String())
 
-	u.Scheme = "tcp"
 	host := u.Host
 	if u.Port() == "" {
 		host = fmt.Sprintf("%s:9000", host)
@@ -44,23 +49,34 @@ func connectionString(initialURL *url.URL) string {
 	u.Host = host
 
 	query := u.Query()
-	if query.Get("username") == "" && u.User.Username() != "" {
-		query.Set("username", u.User.Username())
-	}
-	password, passwordSet := u.User.Password()
-	if query.Get("password") == "" && passwordSet {
-		query.Set("password", password)
-	}
-	u.User = nil
+	username := u.User.Username()
+	password, _ := u.User.Password()
 
-	if query.Get("database") == "" {
-		path := strings.Trim(u.Path, "/")
-		if path != "" {
-			query.Set("database", path)
-			u.Path = ""
+	if query.Get("username") != "" {
+		username = query.Get("username")
+		query.Del("username")
+	}
+	if query.Get("password") != "" {
+		password = query.Get("password")
+		query.Del("password")
+	}
+
+	if username != "" {
+		if password == "" {
+			u.User = url.User(username)
+		} else {
+			u.User = url.UserPassword(username, password)
 		}
 	}
+
+	if query.Get("database") != "" {
+		u.Path = fmt.Sprintf("/%s", query.Get("database"))
+		query.Del("database")
+	}
+
 	u.RawQuery = query.Encode()
+
+	u = ClearClusterParametersFromURL(u)
 
 	return u.String()
 }
@@ -78,15 +94,27 @@ func (drv *Driver) openClickHouseDB() (*sql.DB, error) {
 	}
 
 	// connect to clickhouse database
-	values := clickhouseURL.Query()
-	values.Set("database", "default")
-	clickhouseURL.RawQuery = values.Encode()
+	clickhouseURL.Path = "/default"
 
 	return sql.Open("clickhouse", clickhouseURL.String())
 }
 
+func (drv *Driver) onClusterClause() string {
+	clusterClause := ""
+	if drv.clusterParameters.OnCluster {
+		escapedClusterMacro := drv.escapeString(drv.clusterParameters.ClusterMacro)
+		clusterClause = fmt.Sprintf(" ON CLUSTER '%s'", escapedClusterMacro)
+	}
+	return clusterClause
+}
+
 func (drv *Driver) databaseName() string {
-	name := dbutil.MustParseURL(connectionString(drv.databaseURL)).Query().Get("database")
+	u, err := url.Parse(connectionString(drv.databaseURL))
+	if err != nil {
+		panic(err)
+	}
+
+	name := strings.TrimLeft(u.Path, "/")
 	if name == "" {
 		name = "default"
 	}
@@ -105,10 +133,16 @@ func (drv *Driver) quoteIdentifier(str string) string {
 	return fmt.Sprintf(`"%s"`, str)
 }
 
+func (drv *Driver) escapeString(str string) string {
+	quoteEscaper := strings.NewReplacer(`'`, `\'`, `\`, `\\`)
+	str = quoteEscaper.Replace(str)
+	return str
+}
+
 // CreateDatabase creates the specified database
 func (drv *Driver) CreateDatabase() error {
 	name := drv.databaseName()
-	fmt.Printf("Creating: %s\n", name)
+	fmt.Fprintf(drv.log, "Creating: %s\n", name)
 
 	db, err := drv.openClickHouseDB()
 	if err != nil {
@@ -116,7 +150,9 @@ func (drv *Driver) CreateDatabase() error {
 	}
 	defer dbutil.MustClose(db)
 
-	_, err = db.Exec("create database " + drv.quoteIdentifier(name))
+	q := fmt.Sprintf("CREATE DATABASE %s%s", drv.quoteIdentifier(name), drv.onClusterClause())
+
+	_, err = db.Exec(q)
 
 	return err
 }
@@ -124,7 +160,7 @@ func (drv *Driver) CreateDatabase() error {
 // DropDatabase drops the specified database (if it exists)
 func (drv *Driver) DropDatabase() error {
 	name := drv.databaseName()
-	fmt.Printf("Dropping: %s\n", name)
+	fmt.Fprintf(drv.log, "Dropping: %s\n", name)
 
 	db, err := drv.openClickHouseDB()
 	if err != nil {
@@ -132,15 +168,16 @@ func (drv *Driver) DropDatabase() error {
 	}
 	defer dbutil.MustClose(db)
 
-	_, err = db.Exec("drop database if exists " + drv.quoteIdentifier(name))
+	q := fmt.Sprintf("DROP DATABASE IF EXISTS %s%s", drv.quoteIdentifier(name), drv.onClusterClause())
+
+	_, err = db.Exec(q)
 
 	return err
 }
 
 func (drv *Driver) schemaDump(db *sql.DB, buf *bytes.Buffer, databaseName string) error {
 	buf.WriteString("\n--\n-- Database schema\n--\n\n")
-
-	buf.WriteString("CREATE DATABASE " + drv.quoteIdentifier(databaseName) + " IF NOT EXISTS;\n\n")
+	buf.WriteString(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s%s;\n\n", drv.quoteIdentifier(databaseName), drv.onClusterClause()))
 
 	tables, err := dbutil.QueryColumn(db, "show tables")
 	if err != nil {
@@ -227,17 +264,36 @@ func (drv *Driver) DatabaseExists() (bool, error) {
 	return exists, err
 }
 
+// MigrationsTableExists checks if the schema_migrations table exists
+func (drv *Driver) MigrationsTableExists(db *sql.DB) (bool, error) {
+	exists := false
+	err := db.QueryRow(fmt.Sprintf("EXISTS TABLE %s", drv.quotedMigrationsTableName())).
+		Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+
+	return exists, err
+}
+
 // CreateMigrationsTable creates the schema migrations table
 func (drv *Driver) CreateMigrationsTable(db *sql.DB) error {
+	engineClause := "ReplacingMergeTree(ts)"
+	if drv.clusterParameters.OnCluster {
+		escapedZooPath := drv.escapeString(drv.clusterParameters.ZooPath)
+		escapedReplicaMacro := drv.escapeString(drv.clusterParameters.ReplicaMacro)
+		engineClause = fmt.Sprintf("ReplicatedReplacingMergeTree('%s', '%s', ts)", escapedZooPath, escapedReplicaMacro)
+	}
+
 	_, err := db.Exec(fmt.Sprintf(`
-		create table if not exists %s (
+		create table if not exists %s%s (
 			version String,
 			ts DateTime default now(),
 			applied UInt8 default 1
-		) engine = ReplacingMergeTree(ts)
+		) engine = %s
 		primary key version
 		order by version
-	`, drv.quotedMigrationsTableName()))
+	`, drv.quotedMigrationsTableName(), drv.onClusterClause(), engineClause))
 
 	return err
 }
@@ -298,9 +354,6 @@ func (drv *Driver) DeleteMigration(db dbutil.Transaction, version string) error 
 // Ping verifies a connection to the database server. It does not verify whether the
 // specified database exists.
 func (drv *Driver) Ping() error {
-	// attempt connection to primary database, not "clickhouse" database
-	// to support servers with no "clickhouse" database
-	// (see https://github.com/amacneil/dbmate/issues/78)
 	db, err := drv.Open()
 	if err != nil {
 		return err
@@ -319,6 +372,11 @@ func (drv *Driver) Ping() error {
 	}
 
 	return err
+}
+
+// Return a normalized version of the driver-specific error type.
+func (drv *Driver) QueryError(query string, err error) error {
+	return &dbmate.QueryError{Err: err, Query: query}
 }
 
 func (drv *Driver) quotedMigrationsTableName() string {

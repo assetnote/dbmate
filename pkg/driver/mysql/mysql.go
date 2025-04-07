@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/assetnote/dbmate/pkg/dbmate"
@@ -21,6 +23,7 @@ func init() {
 type Driver struct {
 	migrationsTableName string
 	databaseURL         *url.URL
+	log                 io.Writer
 }
 
 // NewDriver initializes the driver
@@ -28,6 +31,7 @@ func NewDriver(config dbmate.DriverConfig) dbmate.Driver {
 	return &Driver{
 		migrationsTableName: config.MigrationsTableName,
 		databaseURL:         config.DatabaseURL,
+		log:                 config.Log,
 	}
 }
 
@@ -49,7 +53,7 @@ func connectionString(u *url.URL) string {
 
 	// Get decoded user:pass
 	userPassEncoded := u.User.String()
-	userPass, _ := url.QueryUnescape(userPassEncoded)
+	userPass, _ := url.PathUnescape(userPassEncoded)
 
 	// Build DSN w/ user:pass percent-decoded
 	normalizedString := ""
@@ -92,7 +96,7 @@ func (drv *Driver) quoteIdentifier(str string) string {
 // CreateDatabase creates the specified database
 func (drv *Driver) CreateDatabase() error {
 	name := dbutil.DatabaseName(drv.databaseURL)
-	fmt.Printf("Creating: %s\n", name)
+	fmt.Fprintf(drv.log, "Creating: %s\n", name)
 
 	db, err := drv.openRootDB()
 	if err != nil {
@@ -109,7 +113,7 @@ func (drv *Driver) CreateDatabase() error {
 // DropDatabase drops the specified database (if it exists)
 func (drv *Driver) DropDatabase() error {
 	name := dbutil.DatabaseName(drv.databaseURL)
-	fmt.Printf("Dropping: %s\n", name)
+	fmt.Fprintf(drv.log, "Dropping: %s\n", name)
 
 	db, err := drv.openRootDB()
 	if err != nil {
@@ -128,17 +132,21 @@ func (drv *Driver) mysqldumpArgs() []string {
 	args := []string{"--opt", "--routines", "--no-data",
 		"--skip-dump-date", "--skip-add-drop-table"}
 
-	if hostname := drv.databaseURL.Hostname(); hostname != "" {
-		args = append(args, "--host="+hostname)
+	socket := drv.databaseURL.Query().Get("socket")
+	if socket != "" {
+		args = append(args, "--socket="+socket)
+	} else {
+		if hostname := drv.databaseURL.Hostname(); hostname != "" {
+			args = append(args, "--host="+hostname)
+		}
+		if port := drv.databaseURL.Port(); port != "" {
+			args = append(args, "--port="+port)
+		}
 	}
-	if port := drv.databaseURL.Port(); port != "" {
-		args = append(args, "--port="+port)
-	}
+
 	if username := drv.databaseURL.User.Username(); username != "" {
 		args = append(args, "--user="+username)
 	}
-	// mysql recommends against using environment variables to supply password
-	// https://dev.mysql.com/doc/refman/5.7/en/password-security-user.html
 	if password, set := drv.databaseURL.User.Password(); set {
 		args = append(args, "--password="+password)
 	}
@@ -189,7 +197,17 @@ func (drv *Driver) DumpSchema(db *sql.DB) ([]byte, error) {
 	}
 
 	schema = append(schema, migrations...)
-	return dbutil.TrimLeadingSQLComments(schema)
+	schema, err = dbutil.TrimLeadingSQLComments(schema)
+	if err != nil {
+		return nil, err
+	}
+	return trimAutoincrementValues(schema), nil
+}
+
+// trimAutoincrementValues removes AUTO_INCREMENT values from MySQL schema dumps
+func trimAutoincrementValues(data []byte) []byte {
+	aiPattern := regexp.MustCompile(" AUTO_INCREMENT=[0-9]*")
+	return aiPattern.ReplaceAll(data, []byte(""))
 }
 
 // DatabaseExists determines whether the database exists
@@ -212,10 +230,23 @@ func (drv *Driver) DatabaseExists() (bool, error) {
 	return exists, err
 }
 
+// MigrationsTableExists checks if the schema_migrations table exists
+func (drv *Driver) MigrationsTableExists(db *sql.DB) (bool, error) {
+	match := ""
+	err := db.QueryRow(fmt.Sprintf("show tables like '%s'",
+		drv.migrationsTableName)).
+		Scan(&match)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+
+	return match != "", err
+}
+
 // CreateMigrationsTable creates the schema_migrations table
 func (drv *Driver) CreateMigrationsTable(db *sql.DB) error {
-	_, err := db.Exec(fmt.Sprintf("create table if not exists %s "+
-		"(version varchar(255) primary key) character set latin1 collate latin1_bin",
+	_, err := db.Exec(fmt.Sprintf(
+		"create table if not exists %s (version varchar(128) primary key)",
 		drv.quotedMigrationsTableName()))
 
 	return err
@@ -280,6 +311,11 @@ func (drv *Driver) Ping() error {
 	defer dbutil.MustClose(db)
 
 	return db.Ping()
+}
+
+// Return a normalized version of the driver-specific error type.
+func (drv *Driver) QueryError(query string, err error) error {
+	return &dbmate.QueryError{Err: err, Query: query}
 }
 
 func (drv *Driver) quotedMigrationsTableName() string {
