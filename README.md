@@ -481,8 +481,8 @@ package main
 import (
 	"net/url"
 
-	"github.com/amacneil/dbmate/v2/pkg/dbmate"
-	_ "github.com/amacneil/dbmate/v2/pkg/driver/sqlite"
+	"github.com/assetnote/dbmate/pkg/dbmate"
+	_ "github.com/assetnote/dbmate/pkg/driver/sqlite"
 )
 
 func main() {
@@ -512,8 +512,8 @@ import (
 	"fmt"
 	"net/url"
 
-	"github.com/amacneil/dbmate/v2/pkg/dbmate"
-	_ "github.com/amacneil/dbmate/v2/pkg/driver/sqlite"
+	"github.com/assetnote/dbmate/pkg/dbmate"
+	_ "github.com/assetnote/dbmate/pkg/driver/sqlite"
 )
 
 //go:embed db/migrations/*.sql

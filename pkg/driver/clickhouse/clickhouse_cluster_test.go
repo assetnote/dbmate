@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/amacneil/dbmate/v2/pkg/dbmate"
-	"github.com/amacneil/dbmate/v2/pkg/dbtest"
-	"github.com/amacneil/dbmate/v2/pkg/dbutil"
+	"github.com/assetnote/dbmate/pkg/dbmate"
+	"github.com/assetnote/dbmate/pkg/dbtest"
+	"github.com/assetnote/dbmate/pkg/dbutil"
 
 	"github.com/stretchr/testify/require"
 )

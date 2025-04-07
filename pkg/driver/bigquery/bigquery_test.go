@@ -8,9 +8,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/amacneil/dbmate/v2/pkg/dbmate"
-	"github.com/amacneil/dbmate/v2/pkg/dbtest"
-	"github.com/amacneil/dbmate/v2/pkg/dbutil"
+	"github.com/assetnote/dbmate/pkg/dbmate"
+	"github.com/assetnote/dbmate/pkg/dbtest"
+	"github.com/assetnote/dbmate/pkg/dbutil"
 )
 
 func testBigQueryDriver(t *testing.T) *Driver {
