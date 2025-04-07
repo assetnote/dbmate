@@ -27,7 +27,7 @@ func main() {
 	}
 
 	app := NewApp()
-	err := app.Run(os.Args)
+	err = app.Run(os.Args)
 	if err != nil {
 		errText := redactLogString(fmt.Sprintf("Error: %s\n", err))
 		_, _ = fmt.Fprint(os.Stderr, errText)
